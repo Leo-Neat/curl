@@ -63,8 +63,6 @@
 #define NGHTTP2_HAS_SET_LOCAL_WINDOW_SIZE 1
 #endif
 
-#define HTTP2_HUGE_WINDOW_SIZE (1 << 30)
-
 #ifdef DEBUG_HTTP2
 #define H2BUGF(x) x
 #else
@@ -1156,12 +1154,15 @@ static void populate_settings(struct connectdata *conn,
                               struct http_conn *httpc)
 {
   nghttp2_settings_entry *iv = httpc->local_settings;
+  DEBUGASSERT(conn->data);
 
   iv[0].settings_id = NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS;
   iv[0].value = Curl_multi_max_concurrent_streams(conn->data->multi);
 
   iv[1].settings_id = NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE;
-  iv[1].value = HTTP2_HUGE_WINDOW_SIZE;
+  /* this typecast is fine because buffer size can never be larger than
+     32 bit */
+  iv[1].value = (uint32_t)conn->data->set.buffer_size;
 
   iv[2].settings_id = NGHTTP2_SETTINGS_ENABLE_PUSH;
   iv[2].value = conn->data->multi->push_cb != NULL;
@@ -1594,8 +1595,12 @@ static ssize_t http2_recv(struct connectdata *conn, int sockindex,
     return ncopy;
   }
 
-  H2BUGF(infof(data, "http2_recv: easy %p (stream %u)\n",
-               data, stream->stream_id));
+  H2BUGF(infof(data, "http2_recv: easy %p (stream %u) win %u/%u\n",
+               data, stream->stream_id,
+               nghttp2_session_get_local_window_size(httpc->h2),
+               nghttp2_session_get_stream_local_window_size(httpc->h2,
+                                                            stream->stream_id)
+           ));
 
   if((data->state.drain) && stream->memlen) {
     H2BUGF(infof(data, "http2_recv: DRAIN %zu bytes stream %u!! (%p => %p)\n",
@@ -1626,7 +1631,6 @@ static ssize_t http2_recv(struct connectdata *conn, int sockindex,
     stream->pausedata += nread;
     stream->pauselen -= nread;
 
-    infof(data, "%zd data bytes written\n", nread);
     if(stream->pauselen == 0) {
       H2BUGF(infof(data, "Unpaused by stream %u\n", stream->stream_id));
       DEBUGASSERT(httpc->pause_stream_id == stream->stream_id);
@@ -2266,7 +2270,7 @@ CURLcode Curl_http2_switched(struct connectdata *conn,
 
 #ifdef NGHTTP2_HAS_SET_LOCAL_WINDOW_SIZE
   rv = nghttp2_session_set_local_window_size(httpc->h2, NGHTTP2_FLAG_NONE, 0,
-                                             HTTP2_HUGE_WINDOW_SIZE);
+                                             (uint32_t)data->set.buffer_size);
   if(rv != 0) {
     failf(data, "nghttp2_session_set_local_window_size() failed: %s(%d)",
           nghttp2_strerror(rv), rv);
@@ -2327,6 +2331,48 @@ CURLcode Curl_http2_switched(struct connectdata *conn,
     return CURLE_HTTP2;
   }
 
+  return CURLE_OK;
+}
+
+CURLcode Curl_http2_stream_pause(struct Curl_easy *data, bool pause)
+{
+  DEBUGASSERT(data);
+  DEBUGASSERT(data->conn);
+  /* if it isn't HTTP/2, we're done */
+  if(!data->conn->proto.httpc.h2)
+    return CURLE_OK;
+  else {
+#ifdef NGHTTP2_HAS_SET_LOCAL_WINDOW_SIZE
+    struct HTTP *stream = data->req.protop;
+    struct http_conn *httpc = &data->conn->proto.httpc;
+    uint32_t window = !pause * (uint32_t)data->set.buffer_size;
+    uint32_t window2;
+    int rv = nghttp2_session_set_local_window_size(httpc->h2,
+                                                   NGHTTP2_FLAG_NONE,
+                                                   stream->stream_id,
+                                                   window);
+    if(rv) {
+      failf(data, "nghttp2_session_set_local_window_size() failed: %s(%d)",
+            nghttp2_strerror(rv), rv);
+      return CURLE_HTTP2;
+    }
+
+    /* make sure the window update gets sent */
+    rv = h2_session_send(data, httpc->h2);
+    if(rv)
+      return CURLE_SEND_ERROR;
+
+    DEBUGF(infof(data, "Set HTTP/2 window size to %u for stream %u\n",
+                 window, stream->stream_id));
+
+    /* read out the stream local window again */
+    window2 = nghttp2_session_get_stream_local_window_size(httpc->h2,
+                                                           stream->stream_id);
+    DEBUGF(infof(data, "HTTP/2 window size is now %u for stream %u\n",
+                 window2, stream->stream_id));
+
+#endif
+  }
   return CURLE_OK;
 }
 
